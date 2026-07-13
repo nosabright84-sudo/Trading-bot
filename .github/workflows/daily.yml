@@ -1,0 +1,35 @@
+name: Real-Time Trading Alerts
+on:
+  schedule:
+    - cron: '*/15 * * * *'  # Every 15 min = stays in free tier
+  workflow_dispatch:
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write    # <-- This line fixes the 403 error
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      
+      - name: Install dependencies
+        run: pip install python-telegram-bot yfinance pandas
+      
+      - name: Run real-time bot
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python bot.py
+      
+      - name: Commit state file
+        run: |
+          git config user.name 'github-actions'
+          git config user.email 'github-actions@github.com'
+          git add last_signals.json
+          git diff --quiet && git diff --staged --quiet || git commit -m "Update signal state"
+          git push
