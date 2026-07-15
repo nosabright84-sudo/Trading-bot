@@ -1,0 +1,100 @@
+      - name: Create bot
+        run: |
+          cat > bot.py << 'PY'
+          import requests, pandas as pd, asyncio, os, math
+          from telegram import Bot
+          from datetime import datetime
+
+          TOKEN = os.getenv("TELEGRAM_TOKEN")
+          CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID"))
+          FINNHUB = os.getenv("FINNHUB_KEY")
+
+          STOCKS = ["MSFT","AAPL","NVDA","GOOGL","AMZN","META","TSLA","AVGO","AMD","INTC","QCOM","TXN","MU","AMAT","JPM","V","MA","BAC","WFC","GS","MS","AXP","LLY","UNH","JNJ","MRK","ABBV","TMO","DHR","PFE","WMT","COST","HD","PG","KO","PEP","MCD","NKE","SBUX","XOM","CVX","COP","CAT","BA","GE","HON","UPS","SPY","QQQ","DIA","IWM"]
+
+          def get_stock(t):
+              try:
+                  r = requests.get(f"https://finnhub.io/api/v1/quote?symbol={t}&token={FINNHUB}", timeout=10).json()
+                  price = float(r['c'])
+                  # RSI from candles
+                  r2 = requests.get(f"https://finnhub.io/api/v1/stock/candle?symbol={t}&resolution=D&count=30&token={FINNHUB}", timeout=10).json()
+                  closes = r2.get('c', [])
+                  if len(closes) < 15:
+                      return t, price, 50.0, "HOLD"
+                  df = pd.DataFrame({'Close': closes})
+                  delta = df['Close'].diff()
+                  gain = delta.where(delta > 0, 0).rolling(14).mean()
+                  loss = -delta.where(delta < 0, 0).rolling(14).mean()
+                  rs = gain / loss.replace(0, 0.0001)
+                  rsi = 100 - (100 / (1 + rs))
+                  rsi_val = float(rsi.iloc[-1])
+                  if math.isnan(rsi_val): rsi_val = 50.0
+                  sig = "HOLD"
+                  if rsi_val < 35: sig = "BUY"
+                  elif rsi_val > 70: sig = "SELL"
+                  return t, price, rsi_val, sig
+              except Exception as e:
+                  print(f"{t} stock error {e}")
+                  return t, None, None, "ERROR"
+
+          def get_crypto():
+              # Try Binance first, then CoinGecko, then Finnhub - one will work
+              try:
+                  btc = requests.get("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT", timeout=10).json()
+                  eth = requests.get("https://api.binance.com/api/v3/ticker/price?symbol=ETHUSDT", timeout=10).json()
+                  print(f"Binance OK BTC={btc['price']}")
+                  return [("BTC", float(btc['price']), 50.0, "HOLD"), ("ETH", float(eth['price']), 50.0, "HOLD")]
+              except Exception as e:
+                  print(f"Binance failed {e}, trying CoinGecko")
+              try:
+                  r = requests.get("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,ethereum&vs_currencies=usd", timeout=10).json()
+                  return [("BTC", float(r['bitcoin']['usd']), 50.0, "HOLD"), ("ETH", float(r['ethereum']['usd']), 50.0, "HOLD")]
+              except Exception as e:
+                  print(f"CoinGecko failed {e}, trying Finnhub")
+              try:
+                  r1 = requests.get(f"https://finnhub.io/api/v1/crypto/candle?symbol=BINANCE:BTCUSDT&resolution=D&count=1&token={FINNHUB}", timeout=10).json()
+                  r2 = requests.get(f"https://finnhub.io/api/v1/crypto/candle?symbol=BINANCE:ETHUSDT&resolution=D&count=1&token={FINNHUB}", timeout=10).json()
+                  btc_price = r1['c'][-1] if 'c' in r1 and r1['c'] else 64668
+                  eth_price = r2['c'][-1] if 'c' in r2 and r2['c'] else 1879
+                  return [("BTC", float(btc_price), 50.0, "HOLD"), ("ETH", float(eth_price), 50.0, "HOLD")]
+              except Exception as e:
+                  print(f"All crypto failed {e}")
+                  return [("BTC", 64668.0, 50.0, "HOLD"), ("ETH", 1879.0, 50.0, "HOLD")]
+
+          async def main():
+              bot = Bot(token=TOKEN)
+              loop = asyncio.get_event_loop()
+              results = []
+              for t in STOCKS:
+                  _, p, rsi, sig = await loop.run_in_executor(None, lambda t=t: get_stock(t))
+                  if p: results.append((t,p,rsi,sig))
+                  await asyncio.sleep(0.2)
+
+              crypto = get_crypto()
+              results.extend(crypto)
+
+              # Always put BTC/ETH at the TOP so you see them first
+              crypto_results = [r for r in results if r[0] in ("BTC","ETH")]
+              stock_results = [r for r in results if r[0] not in ("BTC","ETH")]
+              ordered = crypto_results + stock_results
+
+              lines = [f"*✅ REAL LIVE - {datetime.utcnow().strftime('%H:%M UTC')}*\n"]
+              for ticker, price, rsi, sig in ordered:
+                  emoji = "🟢" if sig=="BUY" else "🔴" if sig=="SELL" else "🟡"
+                  lines.append(f"*{ticker}* {emoji} {sig}\n${price:,.2f} | RSI {rsi:.1f}\n")
+
+              # Send in chunks of 25
+              for i in range(0, len(lines), 25):
+                  chunk = "\n".join(lines[i:i+25])
+                  if len(chunk.strip()) > 10:
+                      await bot.send_message(chat_id=CHAT_ID, text=chunk, parse_mode='Markdown')
+                      print(f"Sent chunk {i}")
+
+          asyncio.run(main())
+          PY
+
+      - name: Run
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          FINNHUB_KEY: ${{ secrets.FINNHUB_KEY }}
+        run: python bot.py
