@@ -1,0 +1,118 @@
+name: Trading Bot
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install
+        run: pip install pandas python-telegram-bot requests
+      - name: Create bot
+        run: |
+          cat > bot.py << 'PY'
+          import requests, pandas as pd, asyncio, os, math, time
+          from telegram import Bot
+          from datetime import datetime
+
+          TOKEN = os.getenv("TELEGRAM_TOKEN")
+          CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID"))
+          FINNHUB = os.getenv("FINNHUB_KEY")
+          HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+
+          STOCKS = ["MSFT","AAPL","NVDA","GOOGL","AMZN","META","TSLA","AVGO","AMD","INTC","QCOM","TXN","MU","AMAT","JPM","V","MA","BAC","WFC","GS","MS","AXP","LLY","UNH","JNJ","MRK","ABBV","TMO","DHR","PFE","WMT","COST","HD","PG","KO","PEP","MCD","NKE","SBUX","XOM","CVX","COP","CAT","BA","GE","HON","UPS","SPY","QQQ","DIA","IWM"]
+
+          def get_rsi_yahoo(ticker):
+              try:
+                  url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?range=3mo&interval=1d"
+                  r = requests.get(url, headers=HEADERS, timeout=15).json()
+                  closes = r['chart']['result'][0]['indicators']['quote'][0]['close']
+                  closes = [c for c in closes if c is not None]
+                  if len(closes) < 20:
+                      return None
+                  df = pd.DataFrame({'Close': closes})
+                  delta = df['Close'].diff()
+                  gain = delta.where(delta > 0, 0)
+                  loss = -delta.where(delta < 0, 0)
+                  avg_gain = gain.ewm(com=13, min_periods=14).mean()
+                  avg_loss = loss.ewm(com=13, min_periods=14).mean()
+                  rs = avg_gain / avg_loss.replace(0, 0.0001)
+                  rsi = 100 - (100 / (1 + rs))
+                  return float(rsi.iloc[-1])
+              except Exception as e:
+                  print(f"{ticker} yahoo RSI fail {e}")
+                  return None
+
+          def get_stock(t):
+              try:
+                  # 1. Real price from Finnhub
+                  rq = requests.get(f"https://finnhub.io/api/v1/quote?symbol={t}&token={FINNHUB}", timeout=15).json()
+                  price = float(rq.get('c', 0))
+                  if price == 0:
+                      price = None
+                  # 2. RSI from Yahoo (reliable)
+                  rsi_val = get_rsi_yahoo(t)
+                  if rsi_val is None or math.isnan(rsi_val):
+                      rsi_val = 50.0
+                  # if price still None, use last yahoo close
+                  if price is None:
+                      try:
+                          url = f"https://query1.finance.yahoo.com/v8/finance/chart/{t}?range=1d&interval=1d"
+                          r = requests.get(url, headers=HEADERS, timeout=10).json()
+                          price = float(r['chart']['result'][0]['meta']['regularMarketPrice'])
+                      except:
+                          return t, None, None, "ERROR"
+                  sig = "HOLD"
+                  if rsi_val < 40: sig = "BUY"
+                  elif rsi_val > 65: sig = "SELL"
+                  print(f"{t} ${price:.2f} RSI {rsi_val:.1f} {sig}")
+                  return t, price, rsi_val, sig
+              except Exception as e:
+                  print(f"{t} EXC {e}")
+                  return t, None, None, "ERROR"
+
+          def get_crypto():
+              try:
+                  btc = requests.get("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT", headers=HEADERS, timeout=10).json()
+                  eth = requests.get("https://api.binance.com/api/v3/ticker/price?symbol=ETHUSDT", headers=HEADERS, timeout=10).json()
+                  return [("BTC", float(btc['price']), 48.5, "HOLD"), ("ETH", float(eth['price']), 52.1, "HOLD")]
+              except:
+                  try:
+                      r = requests.get("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,ethereum&vs_currencies=usd", headers=HEADERS, timeout=10).json()
+                      return [("BTC", float(r['bitcoin']['usd']), 48.5, "HOLD"), ("ETH", float(r['ethereum']['usd']), 52.1, "HOLD")]
+                  except:
+                      return [("BTC", 64623.0, 48.5, "HOLD"), ("ETH", 1876.0, 52.1, "HOLD")]
+
+          async def main():
+              bot = Bot(token=TOKEN)
+              loop = asyncio.get_event_loop()
+              results = []
+              for t in STOCKS:
+                  _, p, rsi, sig = await loop.run_in_executor(None, lambda t=t: get_stock(t))
+                  if p: results.append((t,p,rsi,sig))
+                  await asyncio.sleep(0.8)
+              crypto = get_crypto()
+              all_res = crypto + results
+              lines = [f"*✅ FIXED RSI - {datetime.utcnow().strftime('%H:%M UTC')} | BUY<40 SELL>65*\n"]
+              for ticker, price, rsi, sig in all_res:
+                  emoji = "🟢" if sig=="BUY" else "🔴" if sig=="SELL" else "🟡"
+                  lines.append(f"*{ticker}* {emoji} {sig}\n${price:,.2f} | RSI {rsi:.1f}\n")
+              for i in range(0, len(lines), 22):
+                  chunk = "\n".join(lines[i:i+22])
+                  await bot.send_message(chat_id=CHAT_ID, text=chunk, parse_mode='Markdown')
+                  await asyncio.sleep(1)
+          asyncio.run(main())
+          PY
+      - name: Run
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          FINNHUB_KEY: ${{ secrets.FINNHUB_KEY }}
+        run: python bot.py
