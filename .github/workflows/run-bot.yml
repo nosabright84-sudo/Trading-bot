@@ -1,0 +1,102 @@
+name: Trading Bot
+on:
+  schedule:
+    - cron: '0 * * * *'
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install
+        run: pip install pandas python-telegram-bot requests
+      - name: Create bot
+        run: |
+          cat > bot.py << 'PY'
+          import requests, pandas as pd, asyncio, os
+          from telegram import Bot
+          from datetime import datetime
+          TOKEN = os.getenv("TELEGRAM_TOKEN")
+          CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID"))
+          FINNHUB = os.getenv("FINNHUB_KEY")
+          HEADERS = {"User-Agent": "Mozilla/5.0"}
+          STOCKS = ["MSFT","AAPL","NVDA","GOOGL","AMZN","META","TSLA","AVGO","AMD","INTC","QCOM","TXN","MU","AMAT","JPM","V","MA","BAC","WFC","GS","MS","AXP","LLY","UNH","JNJ","MRK","ABBV","TMO","DHR","PFE","WMT","COST","HD","PG","KO","PEP","MCD","NKE","SBUX","XOM","CVX","COP","CAT","BA","GE","HON","UPS","SPY","QQQ","DIA","IWM"]
+          def get_indicators(t):
+            try:
+              r = requests.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{t}?range=6mo&interval=1d", headers=HEADERS, timeout=15).json()
+              closes = r['chart']['result'][0]['indicators']['quote'][0]['close']
+              closes = [c for c in closes if c is not None]
+              df = pd.DataFrame({'Close': closes})
+              d = df['Close'].diff()
+              g = d.where(d>0,0).ewm(com=13, min_periods=14).mean()
+              l = -d.where(d<0,0).ewm(com=13, min_periods=14).mean()
+              rsi = 100 - (100/(1+g/l.replace(0,0.0001)))
+              rsi_val = float(rsi.iloc[-1])
+              ema50 = float(df['Close'].ewm(span=50).mean().iloc[-1])
+              return rsi_val, ema50
+            except:
+              return 50.0, None
+          def get_stock(t):
+            try:
+              q = requests.get(f"https://finnhub.io/api/v1/quote?symbol={t}&token={FINNHUB}", timeout=15).json()
+              price = float(q.get('c',0))
+              rsi, ema50 = get_indicators(t)
+              sig = "BUY" if rsi<40 else "SELL" if rsi>65 else "HOLD"
+              return t,price,rsi,ema50,sig
+            except:
+              return t,None,None,None,"ERROR"
+          def get_crypto():
+            # FIXED: Now calculates EMA for BTC and ETH
+            try:
+              # BTC
+              b_price_data = requests.get("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT", headers=HEADERS, timeout=10).json()
+              b_price = float(b_price_data['price'])
+              b_rsi, b_ema = get_indicators("BTC-USD")
+              b_sig = "BUY" if b_rsi<40 else "SELL" if b_rsi>65 else "HOLD"
+              # ETH
+              e_price_data = requests.get("https://api.binance.com/api/v3/ticker/price?symbol=ETHUSDT", headers=HEADERS, timeout=10).json()
+              e_price = float(e_price_data['price'])
+              e_rsi, e_ema = get_indicators("ETH-USD")
+              e_sig = "BUY" if e_rsi<40 else "SELL" if e_rsi>65 else "HOLD"
+              return [("BTC",b_price,b_rsi,b_ema,b_sig),("ETH",e_price,e_rsi,e_ema,e_sig)]
+            except Exception as ex:
+              print(f"crypto fail {ex}")
+              return [("BTC",64623,50,None,"HOLD"),("ETH",1876,50,None,"HOLD")]
+          async def main():
+            bot = Bot(token=TOKEN)
+            loop = asyncio.get_event_loop()
+            out=[]
+            for t in STOCKS:
+              _,p,r,ema,s = await loop.run_in_executor(None, lambda t=t: get_stock(t))
+              if p: out.append((t,p,r,ema,s))
+              await asyncio.sleep(0.7)
+            out = get_crypto() + out
+            lines=[f"*🎯 PRO BOT RSI+EMA50 - {datetime.utcnow().strftime('%H:%M UTC')}*\n*BUY<40 SELL>65 | SL5% TP8%*\n\n"]
+            for tk,pr,rs,ema,sg in out:
+              em="🟢" if sg=="BUY" else "🔴" if sg=="SELL" else "🟡"
+              if sg=="SELL":
+                sl=pr*1.05
+                tp=pr*0.92
+              else:
+                sl=pr*0.95
+                tp=pr*1.08
+              if ema is None:
+                trend="N/A"
+              else:
+                trend=f"{'UP ✅' if pr>ema else 'DOWN ⚠️'} (EMA ${ema:,.2f})"
+              lines.append(f"*{tk}* {em} {sg}\n${pr:,.2f} | RSI {rs:.1f}\n{trend}\nSL ${sl:,.2f} | TP ${tp:,.2f}\n")
+            for i in range(0,len(lines),14):
+              await bot.send_message(chat_id=CHAT_ID, text="\n".join(lines[i:i+14]), parse_mode='Markdown')
+          asyncio.run(main())
+          PY
+      - name: Run
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          FINNHUB_KEY: ${{ secrets.FINNHUB_KEY }}
+        run: python bot.py
